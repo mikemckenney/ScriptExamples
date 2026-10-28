@@ -3,6 +3,9 @@
 
 MWM, Claude assisted cleanup and recommendations/optimizations - 2026-10
 Configure an enterprise application in Entra ID to enable login to 365 via certificate, scoped admin consent to User creation, group/distribution list membership, and Sharepoint site membership.
+Includes an automated creation for a calendar entry - to remind the admin when the cert is going to expire.
+
+At the first Entra ID login, use a GA account.  For the second login, use your credentials, or an account with a shared calendar that you would like to add a calendar entry to.
 #>
 
 # Initial checks/steps
@@ -11,7 +14,7 @@ Configure an enterprise application in Entra ID to enable login to 365 via certi
 
 # Verify that the system is running Powershell 7.0+ and Modules are available
 #Requires -Version 7.0
-#Requires -Modules Microsoft.Graph.Authentication, Microsoft.Graph.Applications, Microsoft.Graph.Identity.DirectoryManagement, Microsoft.Graph.Identity.Governance
+#Requires -Modules Microsoft.Graph.Authentication, Microsoft.Graph.Applications, Microsoft.Graph.Identity.DirectoryManagement, Microsoft.Graph.Identity.Governance, Microsoft.Graph.Calendar
 
 # Disconnect any currently open Office 365 connections
 Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
@@ -25,7 +28,7 @@ $cert_folder = Read-Host "Please enter the complete folder path to store certifi
 $password_token = Read-Host -AsSecureString "Please enter a password to use for the certificate - make note of it in your password manager!"
 
 Write-Host "Tenant Name needed"
-$TenantName = Read-Host "Please enter a single word/no spaces name to use on the certificate."
+$TenantName = Read-Host "Please enter a single word name to use on the certificate."
 
 # Define certificate name and path
 $certname = "$TenantName-UserMgmt"
@@ -46,14 +49,15 @@ if (-not (Test-Path -Path $certFilePath)) {
     $Thumbprint = $Cert.Thumbprint
     $certStartDate = $Cert.NotBefore
     $certEndDate = $Cert.NotAfter
-    else {
+}
+else {
     Write-Host "Certificate already exists. Skipping certificate creation."
     $cert = [Security.Cryptography.X509Certificates.X509Certificate2]::new($certFilePath)
     $Thumbprint = $cert.Thumbprint
     $certStartDate = $cert.NotBefore
     $certEndDate = $cert.NotAfter
     }
-}
+
 #Store Certificate Key in Variable
 [convert]::ToBase64String((Get-Content "$cert_folder\$certName.cer" -AsByteStream)) | Out-File -FilePath "$cert_folder\$certName.key.txt"
 $Key = Get-Content "$cert_folder\$($certName).key.txt"
@@ -66,7 +70,7 @@ Connect-MgGraph -Scopes AppRoleAssignment.ReadWrite.All,Application.ReadWrite.Al
 
 Write-host (Get-MgOrganization).DisplayName
 Write-host (Get-MgContext).Account
-Write-host "Please verify that this is the correct tenant?  Ctrl-C to break/exit"
+Write-host "`n`n`nPlease verify that this is the correct tenant?  Ctrl-C to break/exit`n`n`n"
 pause
 
 # Get the Tenant ID
@@ -172,32 +176,76 @@ Update-MgApplication -ApplicationId $app.Id -BodyParameter $params
 # Define the file path for the CSV
 $filePath = "$cert_folder\$certname.csv"
 
-# Check if the file exists, if not, create it and export the data
-if (-not (Test-Path $filePath)) {
-    Write-Host "File '$filePath' does not exist. Creating the file and exporting data..."
+# Delete the file if it exists and create a new CSV
 
-    # Export data to CSV
-    [PSCustomObject] [ordered] @{
-            Customer=$tenantName
-            ApplicationID=$app.AppId
-            TenantID=$tenantId
-            Thumbprint=$thumbprint
-            Expires=$((Get-ChildItem Cert:\CurrentUser\My\$($Thumbprint)).NotAfter)
-        } | ConvertTo-Csv -NoTypeInformation | ForEach-Object { $_ -replace '"', '' } | Set-Content -Path $FilePath
-    Write-Host "Data exported to '$filePath'."
-} 
-else {
-    # Export data to CSV
-    [PSCustomObject] [ordered] @{
-            Customer=$($tenantName)
-            ApplicationID=$($app.AppId)
-            TenantID=$($tenantId)
-            Thumbprint=$($thumbprint)
-            Expires=$($cert.NotAfter)
-        } | ConvertTo-Csv -NoTypeInformation -NoHeader | ForEach-Object { $_ -replace '"', ''} | Add-Content -Path $FilePath 
-    Write-Host "Data appended to existing '$filePath'."
+If ((Test-Path $filePath)) {
+    Remove-Item -Path $filePath
 }
+
+Write-Host "Creating the file '$filePath' and exporting data..."
+
+# Export data to CSV
+[PSCustomObject] [ordered] @{
+        Customer=$tenantName
+        ApplicationID=$app.AppId
+        TenantID=$tenantId
+        Thumbprint=$thumbprint
+        Expires=$((Get-ChildItem Cert:\CurrentUser\My\$($Thumbprint)).NotAfter)
+    } | ConvertTo-Csv -NoTypeInformation | ForEach-Object { $_ -replace '"', '' } | Set-Content -Path $FilePath
+Write-Host "Data exported to '$filePath'."
+
 Remove-Item "$cert_folder\$($certName).key.txt" -Force
+
+# Close the powershell session
+Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
+
+# Create a calendar entry in Outlook to remind the admin when the cert expires
+# Use Microsoft Graph to access
+
+Write-Host -ForegroundColor Cyan "`n`nConnecting to your default calendar to set an event when this certificate expires.`nPlease login with your personal credentials.`n`n"
+
+Connect-MgGraph -Scopes "Calendars.ReadWrite"
+
+$mg_userid = (get-mgcontext).account
+$DefaultCalendar = (get-mguserdefaultcalendar -userid $mg_userid)
+
+# Gather details for the new calendar entry
+$subject = "$tenantName for $tenantId - certificate expiration"
+$body = "This is a certificate used for Microsoft Graph API access through Powershell."
+$start = ([datetime]"$($cert.NotAfter)").ToString("yyyy-MM-ddTHH:mm:ss")
+$end = ([datetime]$start).AddHours(1).ToString("yyyy-MM-ddTHH:mm:ss")
+
+$params = @{
+	subject = "$($subject)"
+	body = @{
+		contentType = "HTML"
+		content = "$($body)"
+	}
+	start = @{
+		dateTime = "$($start)"
+		timeZone = "Eastern Standard Time"
+	}
+	end = @{
+		dateTime = "$($end)"
+		timeZone = "Eastern Standard Time"
+	}
+	location = @{
+		displayName = "Office"
+	}
+	attendees = @(
+		@{
+			emailAddress = @{
+				address = "$($mg_userid)"
+				name = "SSL Cert Renewal"
+			}
+			type = "required"
+		}
+	)
+    IsReminderOn = $true
+    ReminderMinutesBeforeStart = 10080
+}
+
+New-MgUserCalendarEvent -UserId $mg_userid -CalendarId $DefaultCalendar.Id -BodyParameter $params
 
 Write-Host "Company: $tenantName"
 Write-Host "Tenant ID: $tenantId"
